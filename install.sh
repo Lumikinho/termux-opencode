@@ -12,10 +12,7 @@ BIN_IN_PROOT="/root/.opencode/bin/opencode"
 
 CURRENT=0
 TOTAL=6
-BAR_W=30
 ART_W=106
-FILL_CH="█"; EMPTY_CH="░"
-# se aparecer lixo (�): FILL_CH="#"; EMPTY_CH="-"
 
 # linhas que são só barra de progresso do curl (filtradas do log)
 NOISE='^[#=O[:space:]-]*([0-9.]+%)?$'
@@ -56,22 +53,27 @@ show_banner() {
   fi
 }
 
-draw() {
-  local status="$1" spin="${2:- }" elapsed="${3:-0}"
-  local pct=$((CURRENT * 100 / TOTAL))
-  local filled=$((pct * BAR_W / 100))
-  local bar="" i
-  for ((i = 0; i < BAR_W; i++)); do
-    if [ "$i" -lt "$filled" ]; then bar+="$FILL_CH"; else bar+="$EMPTY_CH"; fi
-  done
-  printf '\r\033[2K[%d/%d] %s %s (%ss)\n\r\033[2K%s %3d%%\033[1A' \
-    "$((CURRENT + 1))" "$TOTAL" "$status" "$spin" "$elapsed" "$bar" "$pct"
+# task <estado> <rótulo> [detalhe] — imprime um item da lista de tarefas
+# estados: done (✔ verde) | run (▶ ciano) | skip (✔ amarelo) | fail (✖ vermelho)
+task() {
+  local state="$1" label="$2" extra="${3:-}"
+  local mark color
+  case "$state" in
+    done) mark="✔"; color='\033[32m' ;;
+    run)  mark="▶"; color='\033[36m' ;;
+    skip) mark="✔"; color='\033[33m' ;;
+    fail) mark="✖"; color='\033[31m' ;;
+    *)    mark="•"; color='' ;;
+  esac
+  printf '%b[%s]%b %s' "$color" "$mark" '\033[0m' "$label"
+  [ -n "$extra" ] && printf ' (%s)' "$extra"
+  printf '\n'
 }
 
 fail() {
   log "!!! FALHA no passo: $1"
-  printf '\033[2B\n'
-  echo "ERRO no passo: $1"
+  printf '\r\033[2K'
+  task fail "$1"
   echo "--- últimas linhas do log ($LOG) ---"
   tail -n 20 "$LOG"
   exit 1
@@ -79,19 +81,28 @@ fail() {
 
 run_step() {
   local label="$1"; shift
-  local spinner='|/-\' i=0 start=$SECONDS rc
+  local spinner='|/-\' i=0 start=$SECONDS rc tmp rcfile
   log ">>> INÍCIO: $label"
-  ( "$@" 2>&1 | tr '\r' '\n' | { grep -avE "$NOISE" || true; } >> "$LOG" ) &
+  # a saída vai para arquivo temporário e o código de saída para $rcfile:
+  # o pipeline antigo (| tr | grep ... || true) sempre terminava com 0 e
+  # escondia a falha real do comando
+  tmp="$(mktemp "${TMPDIR:-/tmp}/opencode-step-XXXXXX")" || fail "$label"
+  rcfile="$tmp.rc"
+  ( "$@" >"$tmp" 2>&1; echo "$?" >"$rcfile" ) &
   local pid=$!
   while kill -0 "$pid" 2>/dev/null; do
-    draw "$label" "${spinner:i++%4:1}" "$((SECONDS - start))"
+    printf '\r\033[2K\033[36m[▶]\033[0m %s %s (%ss)' \
+      "$label" "${spinner:i++%4:1}" "$((SECONDS - start))"
     sleep 0.2
   done
-  wait "$pid"; rc=$?
+  wait "$pid"
+  rc="$(cat "$rcfile" 2>/dev/null || echo 1)"
+  tr '\r' '\n' <"$tmp" | { grep -avE "$NOISE" || true; } >> "$LOG"
+  rm -f "$tmp" "$rcfile"
   log "<<< FIM: $label (código $rc, $((SECONDS - start))s)"
   [ "$rc" -eq 0 ] || fail "$label"
   CURRENT=$((CURRENT + 1))
-  draw "$label" "OK" "$((SECONDS - start))"
+  task done "[$CURRENT/$TOTAL] $label" "$((SECONDS - start))s"
 }
 
 # step <rótulo> <checagem|""> <execução>
@@ -103,8 +114,7 @@ step() {
     if "$check" >> "$LOG" 2>&1; then
       log "--- $label: checagem '$check' OK → pulando"
       CURRENT=$((CURRENT + 1))
-      draw "$label (já instalado)" "--" "0"
-      sleep 0.4
+      task skip "[$CURRENT/$TOTAL] $label" "já instalado"
       return
     fi
     log "--- $label: checagem '$check' falhou → executando"
@@ -150,6 +160,41 @@ if [ -z "$KEEP_PW" ]; then
 fi
 # nunca registramos o valor da senha
 if [ -n "$KEEP_PW" ]; then log "senha: mantida a existente"; else log "senha: nova (valor não registrado)"; fi
+
+# ---------- armazenamento do dispositivo (opcional) ----------
+echo
+echo "Guardar cópia no armazenamento do dispositivo?"
+echo "Copia opencode.jsonc + senha para /sdcard/opencode (sobrevive se o"
+echo "Termux for apagado). ATENÇÃO: lá outros apps podem ler os arquivos."
+read -rp "Ativar? [s/N]: " A
+case "$A" in s|S|y|Y) USE_STORE=1 ;; *) USE_STORE="" ;; esac
+
+if [ -n "$USE_STORE" ]; then
+  if [ -d "$HOME/storage/shared" ]; then
+    log "storage: acesso já liberado"
+  elif command -v termux-setup-storage >/dev/null 2>&1; then
+    echo "Abrindo a permissão do Android: toque em PERMITIR e volte aqui."
+    log "termux-setup-storage"
+    termux-setup-storage >>"$LOG" 2>&1 || log "termux-setup-storage rc=$?"
+    i=0
+    while [ ! -d "$HOME/storage/shared" ] && [ "$i" -lt 30 ]; do
+      sleep 2; i=$((i + 1))
+    done
+    if [ -d "$HOME/storage/shared" ]; then
+      log "storage: acesso liberado"
+      echo "Armazenamento liberado."
+    else
+      echo "Sem acesso ao armazenamento — seguindo sem cópia no /sdcard."
+      log "storage: permissão negada ou tempo esgotado, cópia desativada"
+      USE_STORE=""
+    fi
+  else
+    echo "termux-setup-storage não encontrado — seguindo sem cópia."
+    log "storage: termux-setup-storage ausente, cópia desativada"
+    USE_STORE=""
+  fi
+fi
+if [ -n "$USE_STORE" ]; then TOTAL=7; log "storage: cópia ativada"; else log "storage: cópia desativada"; fi
 
 # ---------- diagnóstico ----------
 log "=== DIAGNÓSTICO ==="
@@ -287,18 +332,33 @@ step_config() {
   make_wrapper
 }
 
+step_storage_mirror() {
+  local d="$HOME/storage/shared/opencode"
+  log "espelho em $d"
+  [ -d "$HOME/storage/shared" ] || return 1
+  mkdir -p "$d" || return 1
+  cp -f "$CFG/opencode.jsonc" "$d/opencode.jsonc" || return 1
+  [ -f "$CFG/major" ] && cp -f "$CFG/major" "$d/major"
+  [ -s "$CFG/password" ] && cp -f "$CFG/password" "$d/password"
+  log "espelho OK: $(ls "$d" 2>&1 | tr '\n' ' ')"
+}
+
 # ---------- execução ----------
 printf '\033[?25l'
 echo
+echo "Tarefas:"
 run_step "Atualizando pacotes do Termux"      step_termux_update
 step "Instalando o proot-distro"              check_proot    step_proot
 step "Instalando o Debian (pode demorar)"     check_debian   step_debian
 step "Instalando dependências do Debian"      check_deps     step_debian_deps
 step "Instalando $LABEL"                      check_opencode step_install
 run_step "Configurando senha e wrapper"       step_config
+if [ -n "${USE_STORE:-}" ]; then
+  step "Cópia no armazenamento do dispositivo" "" step_storage_mirror
+fi
 
 # ---------- verificação final ----------
-printf '\033[2B\n'
+echo
 log "=== VERIFICAÇÃO FINAL ==="
 VER="$(timeout 30 "$PREFIX/bin/opencode" --version 2>&1 | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
 log "opencode --version => ${VER:-<não detectada>} (esperado major $MAJOR)"
